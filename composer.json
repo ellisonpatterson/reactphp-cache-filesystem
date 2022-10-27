@@ -9,9 +9,9 @@
         }
     ],
     "require": {
-        "php": "^7.2",
-        "react/cache": "^1.0",
-        "react/filesystem": "^0.1"
+        "php": "^8.1",
+        "react/cache": "^1.1",
+        "react/filesystem": "^0.2@dev"
     },
     "require-dev": {
         "wyrihaximus/cs-fixer-config": "^1.0",
