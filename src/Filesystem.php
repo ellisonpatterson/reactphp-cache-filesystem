@@ -3,9 +3,10 @@
 namespace WyriHaximus\React\Cache;
 
 use React\Cache\CacheInterface;
-use React\Filesystem\FilesystemInterface as ReactFilesystem;
+use React\Filesystem\AdapterInterface;
 use React\Filesystem\Node\FileInterface;
 use React\Filesystem\Node\NodeInterface;
+use React\Filesystem\Node\NotExistInterface;
 use React\Promise\Promise;
 use React\Promise\PromiseInterface;
 use Throwable;
@@ -16,7 +17,7 @@ use function React\Promise\resolve;
 final class Filesystem implements CacheInterface
 {
     /**
-     * @var ReactFilesystem
+     * @var AdapterInterface
      */
     private $filesystem;
 
@@ -32,10 +33,10 @@ final class Filesystem implements CacheInterface
 
     /**
      * filesystem constructor.
-     * @param ReactFilesystem $filesystem
+     * @param AdapterInterface $filesystem
      * @param string          $path
      */
-    public function __construct(ReactFilesystem $filesystem, string $path)
+    public function __construct(AdapterInterface $filesystem, string $path)
     {
         $this->filesystem = $filesystem;
         $this->path = $path;
@@ -52,21 +53,16 @@ final class Filesystem implements CacheInterface
         return $this->has($key)->then(function (bool $has) use ($key, $default) {
             if ($has === true) {
                 return $this->getFile($key)
-                    ->getContents()
-                    ->then(static function (string $contents) {
-                        return unserialize($contents);
-                    })
+                    ->then(static fn(FileInterface $file) => $file->getContents())
+                    ->then(static fn(string $contents) => unserialize($contents))
                     ->then(
                         function (CacheItem $cacheItem) use ($key, $default) {
                             if ($cacheItem->hasExpired($this->now())) {
                                 return $this->getFile($key)
-                                    ->remove()
-                                    ->then(
-                                        function () use ($default) {
-                                            return resolve($default);
-                                        }
-                                    );
+                                    ->then(fn($file) => $file->unlink())
+                                    ->then(fn($default) => resolve($default));
                             }
+
                             return resolve($cacheItem->data());
                         }
                     );
@@ -83,25 +79,24 @@ final class Filesystem implements CacheInterface
      */
     public function set($key, $value, $ttl = null): PromiseInterface
     {
-        $file = $this->getFile($key);
-        if (\strpos($key, \DIRECTORY_SEPARATOR) === false) {
-            return $this->putContents($file, $value, $ttl);
-        }
-
-        $path = \explode(\DIRECTORY_SEPARATOR, $key);
-        \array_pop($path);
-        $path = \implode(\DIRECTORY_SEPARATOR, $path);
-
-        $dir = $this->filesystem->dir($this->path . $path);
-
-        return $dir->createRecursive()->then(null, function (Throwable $error) {
-            if ($error->getMessage() === 'mkdir(): File exists') {
-                return resolve(true);
+        return $this->getFile($key)->then(function($file) use($key, $value, $ttl) {
+            if (\strpos($key, \DIRECTORY_SEPARATOR) === false) {
+                return $this->putContents($file, $value, $ttl);
             }
-
-            return reject($error);
-        })->then(function () use ($file, $value, $ttl): PromiseInterface {
-            return $this->putContents($file, $value, $ttl);
+    
+            $path = \explode(\DIRECTORY_SEPARATOR, $key);
+            \array_pop($path);
+            $path = \implode(\DIRECTORY_SEPARATOR, $path);
+    
+            return $this->filesystem->detect($this->path . $path)->then(function($node) use($path) {
+                if ($node instanceof NotExistInterface) {
+                    return $node->createDirectory($this->path . $path);
+                }
+    
+                return resolve(true);
+            })->then(function () use ($file, $value, $ttl): PromiseInterface {
+                return $this->putContents($file, $value, $ttl);
+            });
         });
     }
 
@@ -110,13 +105,10 @@ final class Filesystem implements CacheInterface
      */
     public function delete($key): PromiseInterface
     {
-        return $this->has($key)->then(function () use ($key): PromiseInterface {
-            return $this->getFile($key)->remove();
-        })->then(function () {
-            return resolve(true);
-        }, function () {
-            return resolve(false);
-        });
+        return $this->getFile($key)->then(
+            fn($file) => $file->unlink(),
+            fn() => resolve(false)
+        );
     }
 
     public function getMultiple(array $keys, $default = null): PromiseInterface
@@ -167,27 +159,42 @@ final class Filesystem implements CacheInterface
 
     public function clear(): PromiseInterface
     {
-        return (new Promise(function ($resolve, $reject): void {
-            $stream = $this->filesystem->dir($this->path)->lsRecursiveStreaming();
-            $stream->on('data', function (NodeInterface $node) use ($reject): void {
-                if ($node instanceof FileInterface === false) {
-                    return;
-                }
+        return $this->filesystem->detect($this->path)->then(function($node) {
+            if ($node instanceof FileInterface) {
+                return reject();
+            }
 
-                $node->remove()->then(null, $reject);
-            });
-            $stream->on('error', $reject);
-            $stream->on('close', $resolve);
-        }))->then(function () {
-            return resolve(true);
+            return $node->ls();
+        })->then(function (array $nodes) {
+            $keys = array_map(fn($node) => $node->name(), $nodes);
+
+            return $this->deleteMultiple($keys);
         });
+
+        // return (new Promise(function ($resolve, $reject): void {
+        //     $stream = $this->filesystem->directory($this->path)->lsRecursiveStreaming();
+        //     $stream->on('data', function (NodeInterface $node) use ($reject): void {
+        //         if ($node instanceof FileInterface === false) {
+        //             return;
+        //         }
+
+        //         $node->remove()->then(null, $reject);
+        //     });
+
+        //     $stream->on('error', $reject);
+        //     $stream->on('close', $resolve);
+        // }))->then(function () {
+        //     return resolve(true);
+        // });
     }
 
     public function has($key): PromiseInterface
     {
-        return $this->getFile($key)->exists()->then(function () {
-            return resolve(true);
-        }, function () {
+        return $this->filesystem->detect($this->path . $key)->then(function($node) {
+            if ($node instanceof FileInterface) {
+                return resolve(true);
+            }
+
             return resolve(false);
         });
     }
@@ -204,11 +211,17 @@ final class Filesystem implements CacheInterface
 
     /**
      * @param $key
-     * @return FileInterface
+     * @return PromiseInterface
      */
-    private function getFile($key): FileInterface
+    private function getFile($key): PromiseInterface
     {
-        return $this->filesystem->file($this->path . $key);
+        return $this->filesystem->detect($this->path . $key)->then(function($node) {
+            if ($node instanceof NotExistInterface) {
+                return $node->createFile();
+            }
+
+            return $node;
+        });
     }
 
     /**
