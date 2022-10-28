@@ -5,6 +5,7 @@ namespace WyriHaximus\React\Cache;
 use React\Cache\CacheInterface;
 use React\Filesystem\AdapterInterface;
 use React\Filesystem\Node\FileInterface;
+use React\Filesystem\Node\DirectoryInterface;
 use React\Filesystem\Node\NodeInterface;
 use React\Filesystem\Node\NotExistInterface;
 use React\Promise\Promise;
@@ -59,8 +60,8 @@ final class Filesystem implements CacheInterface
                         function (CacheItem $cacheItem) use ($key, $default) {
                             if ($cacheItem->hasExpired($this->now())) {
                                 return $this->getFile($key)
-                                    ->then(fn($file) => $file->unlink())
-                                    ->then(fn($default) => resolve($default));
+                                    ->then(static fn($file) => $file->unlink())
+                                    ->then(static fn($default) => resolve($default));
                             }
 
                             return resolve($cacheItem->data());
@@ -106,8 +107,8 @@ final class Filesystem implements CacheInterface
     public function delete($key): PromiseInterface
     {
         return $this->getFile($key)->then(
-            fn($file) => $file->unlink(),
-            fn() => resolve(false)
+            static fn($file) => $file->unlink(),
+            static fn() => resolve(false)
         );
     }
 
@@ -159,33 +160,31 @@ final class Filesystem implements CacheInterface
 
     public function clear(): PromiseInterface
     {
-        return $this->filesystem->detect($this->path)->then(function($node) {
-            if ($node instanceof FileInterface) {
-                return reject();
-            }
+        $structure = [];
 
-            return $node->ls();
-        })->then(function (array $nodes) {
-            $keys = array_map(fn($node) => $node->name(), $nodes);
+        $ls = function(string $path) use(&$ls, &$structure) {
+            return $this->filesystem->detect($path)->then(function($node) {
+                return $node->ls();
+            })->then(function (array $nodes) use(&$ls, &$structure) {
+                $promises = [];
 
-            return $this->deleteMultiple($keys);
+                foreach ($nodes as $node) {
+                    assert($node instanceof NodeInterface);
+
+                    $structure[] = $node;
+
+                    if ($node instanceof DirectoryInterface) {
+                        $promises[] = $ls($node->path() . $node->name());
+                    }
+                }
+
+                return all($promises);
+            });
+        };
+
+        return $ls($this->path)->then(function() use(&$structure) {
+            // unlinking directories isn't consistent, need to reverse array and run in series?
         });
-
-        // return (new Promise(function ($resolve, $reject): void {
-        //     $stream = $this->filesystem->directory($this->path)->lsRecursiveStreaming();
-        //     $stream->on('data', function (NodeInterface $node) use ($reject): void {
-        //         if ($node instanceof FileInterface === false) {
-        //             return;
-        //         }
-
-        //         $node->remove()->then(null, $reject);
-        //     });
-
-        //     $stream->on('error', $reject);
-        //     $stream->on('close', $resolve);
-        // }))->then(function () {
-        //     return resolve(true);
-        // });
     }
 
     public function has($key): PromiseInterface
